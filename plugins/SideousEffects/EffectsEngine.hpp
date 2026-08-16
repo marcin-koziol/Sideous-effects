@@ -2,10 +2,12 @@
  * Sideous Effects - the actual effect chain: params, and per-sample
  * processing for one stereo pair. Deliberately DPF-agnostic (no
  * DistrhoPlugin.hpp dependency), same convention as the family's DrumEngine
- * classes. Fixed signal order: Bitcrush -> Fold -> RingMod -> LofiFilter ->
- * Delay -> Master Drive -> Master Output. Every stage before Master has its
- * own Mix knob (dry/wet blend into the next stage); Master applies to the
- * finished stereo pair.
+ * classes. 5 tonal stages (Bitcrush, Fold, RingMod, Lofi Filter, Delay) run
+ * in a user-reorderable order (see Params.hpp's resolveChainOrder()/
+ * StageKind - shared with the UI side so the two can't disagree on
+ * ordering), then Master Drive -> Master Output always run last. Every
+ * reorderable stage has its own Mix knob (dry/wet blend into the next
+ * stage); Master applies to the finished stereo pair.
  */
 
 #pragma once
@@ -56,6 +58,11 @@ public:
         fR.ring.setSampleRate(sampleRate);
         fL.delay.setSampleRate(sampleRate);
         fR.delay.setSampleRate(sampleRate);
+        // distinct seeds so L/R jitter independently instead of in lockstep,
+        // same "seed each instance differently" convention DrumEngine.hpp
+        // uses for its noise generators
+        fL.delay.setJitterSeed(0x6A09E667u);
+        fR.delay.setJitterSeed(0xBB67AE85u);
         updateDelayTime();
     }
 
@@ -116,10 +123,46 @@ public:
         case kParamDelayArp:
             fL.delay.setArpSemitones(value); fR.delay.setArpSemitones(value);
             break;
+        case kParamDelaySpeed:
+            fL.delay.setSpeed(value); fR.delay.setSpeed(value);
+            break;
+        case kParamDelayRamp:
+            fL.delay.setRampSemitones(value); fR.delay.setRampSemitones(value);
+            break;
+        case kParamDelayArpSteps:
+        {
+            const int steps = (int)(value + 0.5f);
+            fL.delay.setArpSteps(steps); fR.delay.setArpSteps(steps);
+            break;
+        }
+        case kParamDelayArpCurve:
+        {
+            const ArpCurve curve = value < 0.5f ? ArpCurve::Pitch : ArpCurve::Tempo;
+            fL.delay.setArpCurve(curve); fR.delay.setArpCurve(curve);
+            break;
+        }
+        case kParamDelayArpDirection:
+        {
+            const ArpDirection dir = (ArpDirection)(int)(value + 0.5f);
+            fL.delay.setArpDirection(dir); fR.delay.setArpDirection(dir);
+            break;
+        }
+        case kParamDelayPingPong: fDelayPingPong = value; break;
+        case kParamDelayJitter:
+            fL.delay.setJitterAmount(value); fR.delay.setJitterAmount(value);
+            break;
         case kParamDelayMix: fDelayMix = value; break;
 
         case kParamMasterOutput: fMasterOutput = value; break;
         case kParamMasterDrive:  fDistortion.setDrive(value); break;
+
+        case kParamChainPosBitcrush:
+        case kParamChainPosFold:
+        case kParamChainPosRingMod:
+        case kParamChainPosLofi:
+        case kParamChainPosDelay:
+            resolveChainOrder(fValues, fChainOrder);
+            break;
 
         default: break;
         }
@@ -127,8 +170,8 @@ public:
 
     void process(float inL, float inR, float& outL, float& outR) noexcept
     {
-        outL = processChannel(inL, fL);
-        outR = processChannel(inR, fR);
+        outL = processChannel(inL, fL, false);
+        outR = processChannel(inR, fR, true);
 
         outL = fDistortion.process(outL) * fMasterOutput;
         outR = fDistortion.process(outR) * fMasterOutput;
@@ -144,25 +187,55 @@ private:
         DelayLine delay;
     };
 
-    float processChannel(float in, Channel& ch) noexcept
+    float applyStage(int stage, float x, Channel& ch, bool isRightChannel) noexcept
+    {
+        switch (stage)
+        {
+        case kStageBitcrush:
+        {
+            const float bc = ch.crusher.process(x);
+            return x + (bc - x) * fBitcrushMix;
+        }
+        case kStageFold:
+        {
+            const float fo = ch.fold.process(x);
+            return x + (fo - x) * fFoldMix;
+        }
+        case kStageRingMod:
+        {
+            const float rm = ch.ring.process(x);
+            return x + (rm - x) * fRingMix;
+        }
+        case kStageLofi:
+        {
+            const float lf = ch.filter.process(x, fLofiCutoffHz);
+            return x + (lf - x) * fLofiMix;
+        }
+        case kStageDelay:
+        {
+            float dl = ch.delay.process(x);
+            if (fDelayPingPong > 0.0f)
+            {
+                // alternate taps favor L/R - even tap index favors Left,
+                // odd favors Right; the "off" channel for this tap gets
+                // attenuated by the Ping-Pong amount instead of hard-panned,
+                // so it stays usable as a subtle width control too
+                const bool tapFavorsRight = (ch.delay.getTapIndex() % 2) != 0;
+                if (tapFavorsRight != isRightChannel)
+                    dl *= (1.0f - fDelayPingPong);
+            }
+            return x + (dl - x) * fDelayMix;
+        }
+        default:
+            return x;
+        }
+    }
+
+    float processChannel(float in, Channel& ch, bool isRightChannel) noexcept
     {
         float x = in;
-
-        const float bc = ch.crusher.process(x);
-        x += (bc - x) * fBitcrushMix;
-
-        const float fo = ch.fold.process(x);
-        x += (fo - x) * fFoldMix;
-
-        const float rm = ch.ring.process(x);
-        x += (rm - x) * fRingMix;
-
-        const float lf = ch.filter.process(x, fLofiCutoffHz);
-        x += (lf - x) * fLofiMix;
-
-        const float dl = ch.delay.process(x);
-        x += (dl - x) * fDelayMix;
-
+        for (int i = 0; i < kStageCount; ++i)
+            x = applyStage(fChainOrder[i], x, ch, isRightChannel);
         return x;
     }
 
@@ -180,12 +253,15 @@ private:
     Channel fL, fR;
     Distortion fDistortion; // stateless per-call, one instance covers both channels
 
+    int fChainOrder[kStageCount] = { kStageBitcrush, kStageFold, kStageRingMod, kStageLofi, kStageDelay };
+
     float fBitcrushMix = 0.0f;
     float fFoldMix = 0.0f;
     float fRingMix = 0.0f;
     float fLofiCutoffHz = 3000.0f;
     float fLofiMix = 0.0f;
     float fDelaySync = 9.0f;
+    float fDelayPingPong = 0.0f;
     float fDelayMix = 0.0f;
     float fMasterOutput = 0.85f;
 };

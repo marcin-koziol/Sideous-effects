@@ -62,6 +62,22 @@ inline const std::vector<FactoryPreset>& factoryPresets()
             { "delay_sync", 6.0f }, { "delay_feedback", 0.3f }, { "delay_arp", 1.0f }, { "delay_mix", 0.35f },
             { "master_drive", 0.1f },
         }},
+        // Bitcrush dragged to the very end of the chain, right before
+        // Master - quantization noise as the last thing before output,
+        // like a real POKEY-style chip's 4-bit-per-channel DAC. Also shows
+        // off the Delay's fuller arp shape: 4 steps, Up-Down direction,
+        // Tempo curve (so it doesn't run away), a little Ping-Pong width
+        // and Jitter wobble.
+        { "POKEY Quantize", {
+            { "chain_pos_fold", 0.0f }, { "chain_pos_ringmod", 1.0f }, { "chain_pos_lofi", 2.0f },
+            { "chain_pos_delay", 3.0f }, { "chain_pos_bitcrush", 4.0f },
+            { "fold_drive", 0.5f }, { "fold_mix", 0.3f },
+            { "delay_sync", 9.0f }, { "delay_feedback", 0.4f }, { "delay_arp", 5.0f },
+            { "delay_arp_steps", 4.0f }, { "delay_arp_curve", 1.0f }, { "delay_arp_direction", 2.0f },
+            { "delay_pingpong", 0.4f }, { "delay_jitter", 0.15f }, { "delay_mix", 0.4f },
+            { "bitcrush_bits", 4.0f }, { "bitcrush_rate", 3.0f }, { "bitcrush_mix", 0.7f },
+            { "master_drive", 0.1f },
+        }},
     };
     return presets;
 }

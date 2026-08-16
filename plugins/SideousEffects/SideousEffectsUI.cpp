@@ -2,9 +2,12 @@
  * Sideous Effects - custom Cairo UI, ported from sideous-chipdrums'
  * SideousChipDrumsUI.cpp (preset-bar CRUD, knob drag/scroll/double-click)
  * plus the Selector/Dropdown mouse handling from sideous's SideousUI.cpp
- * (Ring Mod's Wave selector, Delay's Sync dropdown) - this plugin has no
- * MIDI trigger pads, so the panel-trigger handling from both of those isn't
- * needed here.
+ * (Ring Mod's Wave selector, Delay's Sync dropdown/3 arp-shape selectors).
+ * New here: panels can be dragged by their header strip to reorder the
+ * chain (see reorderChain() below) - the 5 tonal stages' processing order
+ * is stored as one "chain position" param per stage (Params.hpp's
+ * resolveChainOrder()), not as a permutation, so there's nothing else to
+ * validate here beyond recomputing all 5 positions on drop.
  */
 
 #include "DistrhoUI.hpp"
@@ -31,10 +34,13 @@ public:
     SideousEffectsUI()
         : UI()
     {
-        fLayout = ui::buildLayout((float)getWidth(), (float)getHeight());
-
+        // fValues must be populated before the first buildLayout() call now
+        // - panel placement depends on the 5 ChainPos* param values, not
+        // just the window size.
         for (uint32_t i = 0; i < kParamCount; ++i)
             fValues[i] = getParamInfo(i).def;
+
+        fLayout = ui::buildLayout((float)getWidth(), (float)getHeight(), fValues);
 
         fPresetNames = ui::listPresets();
         if (fPresetNames.empty())
@@ -69,6 +75,13 @@ protected:
         }
 
         fValues[index] = value;
+
+        // a chain-order param changed (host automation, or a preset just
+        // applied it outside of loadPresetAt()'s own rebuild) - panel
+        // positions depend on these, so the layout needs to follow
+        if (isChainPosParam(index))
+            fLayout = ui::buildLayout((float)getWidth(), (float)getHeight(), fValues);
+
         repaint();
     }
 
@@ -119,6 +132,12 @@ protected:
         state.hoverPresetButton = fHoverPresetButton;
         state.presetDeleteEnabled = fPresetIndex >= 0;
 
+        state.hoverPanel = fHoverPanel;
+        state.dragPanel = fDragPanel;
+        state.dropTargetCell = fDropTargetCell;
+        state.dragGhostX = fDragCurrentX - fDragGrabDX;
+        state.dragGhostY = fDragCurrentY - fDragGrabDY;
+
         ui::paint(context.handle, fLayout, state);
     }
 
@@ -167,7 +186,7 @@ protected:
             {
                 // clicked elsewhere while editing - cancel without applying,
                 // then fall through so the click still does whatever it was
-                // actually pointing at (a knob/selector/dropdown)
+                // actually pointing at (a knob/selector/dropdown/panel)
                 fEditingName = false;
                 repaint();
             }
@@ -212,6 +231,19 @@ protected:
                 return true;
             }
 
+            const int panelIdx = hitTestPanelHeader(mx, my);
+            if (panelIdx >= 0)
+            {
+                fDragPanel = panelIdx;
+                fDragGrabDX = mx - fLayout.panels[(size_t)panelIdx].x;
+                fDragGrabDY = my - fLayout.panels[(size_t)panelIdx].y;
+                fDragCurrentX = mx;
+                fDragCurrentY = my;
+                fDropTargetCell = panelIdx;
+                repaint();
+                return true;
+            }
+
             const int knobIdx = hitTestKnob(mx, my);
             if (knobIdx < 0)
                 return false;
@@ -251,6 +283,15 @@ protected:
             return true;
         }
 
+        if (fDragPanel >= 0)
+        {
+            reorderChain(fDragPanel, fDropTargetCell);
+            fDragPanel = -1;
+            fDropTargetCell = -1;
+            repaint();
+            return true;
+        }
+
         return false;
     }
 
@@ -267,9 +308,22 @@ protected:
             float t = fDragStartT + (float)(dy / 200.0);
             t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
 
-            const float value = ui::normalizedToParam(k.param, t);
+            float value = ui::normalizedToParam(k.param, t);
+            if ((ev.mod & kModifierShift) != 0)
+                value = ui::quantizeToSemitoneStep(k.param, value);
             fValues[k.param] = value;
             setParameterValue(k.param, value);
+            repaint();
+            return true;
+        }
+
+        if (fDragPanel >= 0)
+        {
+            fDragCurrentX = mx;
+            fDragCurrentY = my;
+            const int newTarget = hitTestDropCell(mx, my);
+            if (newTarget != fDropTargetCell)
+                fDropTargetCell = newTarget;
             repaint();
             return true;
         }
@@ -290,15 +344,18 @@ protected:
         hitTestSelector(mx, my, selIdx, optIdx);
         const int newHoverDropdown = hitTestDropdownClosed(mx, my);
         const int newHoverPresetButton = hitTestPresetButton(mx, my);
+        const int newHoverPanel = hitTestPanelHeader(mx, my);
 
         if (newHoverKnob != fHoverKnob || selIdx != fHoverSelector || optIdx != fHoverSelectorOption
-            || newHoverDropdown != fHoverDropdown || newHoverPresetButton != fHoverPresetButton)
+            || newHoverDropdown != fHoverDropdown || newHoverPresetButton != fHoverPresetButton
+            || newHoverPanel != fHoverPanel)
         {
             fHoverKnob = newHoverKnob;
             fHoverSelector = selIdx;
             fHoverSelectorOption = optIdx;
             fHoverDropdown = newHoverDropdown;
             fHoverPresetButton = newHoverPresetButton;
+            fHoverPanel = newHoverPanel;
             repaint();
         }
 
@@ -307,7 +364,7 @@ protected:
 
     bool onScroll(const ScrollEvent& ev) override
     {
-        if (fOpenDropdown >= 0)
+        if (fOpenDropdown >= 0 || fDragPanel >= 0)
             return false;
 
         const int knobIdx = hitTestKnob(ev.pos.getX(), ev.pos.getY());
@@ -320,7 +377,9 @@ protected:
         float newT = t + (ev.delta.getY() > 0.0 ? step : -step);
         newT = newT < 0.0f ? 0.0f : (newT > 1.0f ? 1.0f : newT);
 
-        const float value = ui::normalizedToParam(k.param, newT);
+        float value = ui::normalizedToParam(k.param, newT);
+        if ((ev.mod & kModifierShift) != 0)
+            value = ui::quantizeToSemitoneStep(k.param, value);
         editParameter(k.param, true);
         setParameterValue(k.param, value);
         editParameter(k.param, false);
@@ -467,6 +526,94 @@ private:
         return x >= pb.nameX && x <= pb.nameX + pb.nameW && y >= pb.nameY && y <= pb.nameY + pb.nameH;
     }
 
+    // header strip (drag handle) of one of the 5 reorderable panels -
+    // Master (index 5, draggable=false) never hit-tests positive here
+    int hitTestPanelHeader(double x, double y) const noexcept
+    {
+        for (size_t i = 0; i < fLayout.panels.size(); ++i)
+        {
+            const ui::PanelBox& p = fLayout.panels[i];
+            if (!p.draggable)
+                continue;
+            if (x >= p.x && x <= p.x + p.w && y >= p.y && y <= p.y + ui::kPanelHeaderH)
+                return (int)i;
+        }
+        return -1;
+    }
+
+    // whole-cell hit test for drag drop targets - more forgiving than the
+    // header-only zone, since dropping anywhere on a cell should count
+    int hitTestDropCell(double x, double y) const noexcept
+    {
+        for (size_t i = 0; i < fLayout.panels.size(); ++i)
+        {
+            const ui::PanelBox& p = fLayout.panels[i];
+            if (!p.draggable)
+                continue;
+            if (x >= p.x && x <= p.x + p.w && y >= p.y && y <= p.y + p.h)
+                return (int)i;
+        }
+        return -1;
+    }
+
+    static bool isChainPosParam(uint32_t index) noexcept
+    {
+        return index == kParamChainPosBitcrush || index == kParamChainPosFold ||
+               index == kParamChainPosRingMod   || index == kParamChainPosLofi ||
+               index == kParamChainPosDelay;
+    }
+
+    // moves the stage occupying `sourceCell` to `targetCell`, shifting
+    // whatever was in between over by one to fill the gap - e.g. dragging
+    // cell 0 onto cell 4 pushes cells 1-4 back to 0-3 and the dragged stage
+    // lands in 4 (matches "drag it to exactly where you dropped it").
+    // Recomputes all 5 ChainPos* param values from the result and rebuilds
+    // the layout - Master (cell 5) is never involved, it's not draggable.
+    void reorderChain(int sourceCell, int targetCell) noexcept
+    {
+        if (sourceCell < 0 || targetCell < 0 || sourceCell == targetCell ||
+            sourceCell >= kStageCount || targetCell >= kStageCount)
+            return;
+
+        int order[kStageCount];
+        resolveChainOrder(fValues, order);
+
+        int finalOrder[kStageCount];
+        for (int i = 0; i < kStageCount; ++i)
+            finalOrder[i] = order[i];
+
+        const int movingStage = order[sourceCell];
+        if (sourceCell < targetCell)
+        {
+            for (int i = sourceCell; i < targetCell; ++i)
+                finalOrder[i] = order[i + 1];
+        }
+        else
+        {
+            for (int i = sourceCell; i > targetCell; --i)
+                finalOrder[i] = order[i - 1];
+        }
+        finalOrder[targetCell] = movingStage;
+
+        static constexpr uint32_t kChainParams[kStageCount] = {
+            kParamChainPosBitcrush, kParamChainPosFold, kParamChainPosRingMod,
+            kParamChainPosLofi, kParamChainPosDelay,
+        };
+
+        for (int cell = 0; cell < kStageCount; ++cell)
+        {
+            const int stage = finalOrder[cell];
+            const float posValue = (float)cell;
+            editParameter(kChainParams[stage], true);
+            setParameterValue(kChainParams[stage], posValue);
+            editParameter(kChainParams[stage], false);
+            fValues[kChainParams[stage]] = posValue;
+        }
+
+        fDirty = true;
+        fLayout = ui::buildLayout((float)getWidth(), (float)getHeight(), fValues);
+    }
+
     // ---------------------------------------------------------------------
     // preset CRUD - index < 0 means INIT (compiled-in defaults, no file)
 
@@ -494,6 +641,9 @@ private:
             setParameterValue(i, fValues[i]);
             editParameter(i, false);
         }
+
+        // a loaded preset (or INIT) can carry a different chain order
+        fLayout = ui::buildLayout((float)getWidth(), (float)getHeight(), fValues);
 
         fDirty = false;
         fLoadingPreset = false;
@@ -563,6 +713,12 @@ private:
     int fHoverDropdown = -1;
     int fOpenDropdown = -1;
     int fHoverDropdownOption = -1;
+
+    int fHoverPanel = -1;
+    int fDragPanel = -1;
+    int fDropTargetCell = -1;
+    double fDragGrabDX = 0.0, fDragGrabDY = 0.0;   // click point relative to the panel's top-left
+    double fDragCurrentX = 0.0, fDragCurrentY = 0.0;
 
     int fLastClickKnob = -1;
     std::chrono::steady_clock::time_point fLastClickTime{};

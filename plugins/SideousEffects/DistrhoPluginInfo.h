@@ -22,9 +22,9 @@
 #define DISTRHO_PLUGIN_WANT_TIMEPOS     1
 
 #define DISTRHO_UI_USE_CAIRO             1
-#define DISTRHO_UI_DEFAULT_WIDTH         900
-#define DISTRHO_UI_DEFAULT_HEIGHT        420
-// must match the height ui/UIPainter.hpp's buildLayout() actually lays out to
+#define DISTRHO_UI_DEFAULT_WIDTH         980
+#define DISTRHO_UI_DEFAULT_HEIGHT        910
+// must match what ui/UIPainter.hpp's buildLayout() actually lays out to
 // (verified via Xvfb screenshot) - keep these two in sync by hand.
 
 #endif // DISTRHO_PLUGIN_INFO_H_INCLUDED

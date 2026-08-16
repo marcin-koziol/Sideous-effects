@@ -31,10 +31,28 @@ enum Params : uint32_t {
     kParamDelaySync,
     kParamDelayFeedback,
     kParamDelayArp,
+    kParamDelaySpeed,
+    kParamDelayRamp,
+    kParamDelayArpSteps,
+    kParamDelayArpCurve,
+    kParamDelayArpDirection,
+    kParamDelayPingPong,
+    kParamDelayJitter,
     kParamDelayMix,
 
     kParamMasterOutput,
     kParamMasterDrive,
+
+    // chain routing - one "position in the signal chain" slot per
+    // reorderable stage (Master is not reorderable, it's always last).
+    // Processing order is derived by stable-sorting these 5 by value (see
+    // resolveChainOrder() below), not stored as an explicit permutation -
+    // so there's no "invalid" state a host/preset could put it in.
+    kParamChainPosBitcrush,
+    kParamChainPosFold,
+    kParamChainPosRingMod,
+    kParamChainPosLofi,
+    kParamChainPosDelay,
 
     kParamCount
 };
@@ -70,15 +88,66 @@ inline const ParamInfo& getParamInfo(uint32_t index) noexcept
         { "Lo-fi Reso",   "lofi_reso",   "",    0.0f,   1.0f,     0.15f,   ParamShape::Linear },
         { "Lo-fi Mix",    "lofi_mix",    "",    0.0f,   1.0f,     0.0f,    ParamShape::Linear },
 
-        { "Delay Sync",     "delay_sync",     "",  0.0f, 16.0f, 9.0f,  ParamShape::Linear },
-        { "Delay Feedback", "delay_feedback", "",  0.0f, 0.95f, 0.35f, ParamShape::Linear },
-        { "Delay Arp",      "delay_arp",      "st",0.0f, 12.0f, 0.0f,  ParamShape::Linear },
-        { "Delay Mix",      "delay_mix",      "",  0.0f, 1.0f,  0.0f,  ParamShape::Linear },
+        { "Delay Sync",          "delay_sync",          "",   0.0f, 16.0f, 9.0f,  ParamShape::Linear },
+        { "Delay Feedback",      "delay_feedback",       "",   0.0f, 0.95f, 0.35f, ParamShape::Linear },
+        { "Delay Arp",           "delay_arp",             "st", 0.0f, 12.0f, 0.0f,  ParamShape::Linear },
+        { "Delay Speed",         "delay_speed",           "x",  0.25f, 4.0f, 1.0f,  ParamShape::Logarithmic },
+        { "Delay Ramp",          "delay_ramp",            "st", 0.0f, 12.0f, 0.0f,  ParamShape::Linear },
+        { "Delay Arp Steps",     "delay_arp_steps",       "",   2.0f, 4.0f,  3.0f,  ParamShape::Linear },
+        { "Delay Arp Curve",     "delay_arp_curve",       "",   0.0f, 1.0f,  0.0f,  ParamShape::Linear },
+        { "Delay Arp Direction", "delay_arp_direction",   "",   0.0f, 2.0f,  0.0f,  ParamShape::Linear },
+        { "Delay Ping-Pong",     "delay_pingpong",        "",   0.0f, 1.0f,  0.0f,  ParamShape::Linear },
+        { "Delay Jitter",        "delay_jitter",          "",   0.0f, 1.0f,  0.0f,  ParamShape::Linear },
+        { "Delay Mix",           "delay_mix",              "",   0.0f, 1.0f,  0.0f,  ParamShape::Linear },
 
         { "Master Output", "master_output", "", 0.0f, 1.0f, 0.85f, ParamShape::Linear },
         { "Master Drive",  "master_drive",  "", 0.0f, 1.0f, 0.0f,  ParamShape::Linear },
+
+        { "Chain Position: Bitcrush", "chain_pos_bitcrush", "", 0.0f, 4.0f, 0.0f, ParamShape::Linear },
+        { "Chain Position: Fold",     "chain_pos_fold",     "", 0.0f, 4.0f, 1.0f, ParamShape::Linear },
+        { "Chain Position: Ring Mod", "chain_pos_ringmod",  "", 0.0f, 4.0f, 2.0f, ParamShape::Linear },
+        { "Chain Position: Lo-fi",    "chain_pos_lofi",     "", 0.0f, 4.0f, 3.0f, ParamShape::Linear },
+        { "Chain Position: Delay",    "chain_pos_delay",    "", 0.0f, 4.0f, 4.0f, ParamShape::Linear },
     };
     return table[index];
+}
+
+// -----------------------------------------------------------------------------------------------------------
+// chain order
+
+// the 5 reorderable tonal stages - Master (Drive/Output) is not part of
+// this, it's always the final stage after the loop
+enum StageKind { kStageBitcrush = 0, kStageFold, kStageRingMod, kStageLofi, kStageDelay, kStageCount };
+
+// stable-sorts the 5 stages by their ChainPos* param value into `order` -
+// shared by EffectsEngine.hpp (DSP side) and UIPainter.hpp (UI side), which
+// both already include this header, so the two can't disagree on ordering.
+// Plain insertion sort: kStageCount is fixed at 5, not worth pulling in
+// <algorithm> for, and insertion sort is trivially stable (equal-valued
+// stages keep their relative order rather than swapping past each other).
+inline void resolveChainOrder(const float* values, int order[kStageCount]) noexcept
+{
+    struct Ranked { float pos; int stage; };
+    Ranked ranked[kStageCount] = {
+        { values[kParamChainPosBitcrush], kStageBitcrush },
+        { values[kParamChainPosFold],     kStageFold },
+        { values[kParamChainPosRingMod],  kStageRingMod },
+        { values[kParamChainPosLofi],     kStageLofi },
+        { values[kParamChainPosDelay],    kStageDelay },
+    };
+    for (int i = 1; i < kStageCount; ++i)
+    {
+        Ranked key = ranked[i];
+        int j = i - 1;
+        while (j >= 0 && ranked[j].pos > key.pos)
+        {
+            ranked[j + 1] = ranked[j];
+            --j;
+        }
+        ranked[j + 1] = key;
+    }
+    for (int i = 0; i < kStageCount; ++i)
+        order[i] = ranked[i].stage;
 }
 
 } // namespace sideous

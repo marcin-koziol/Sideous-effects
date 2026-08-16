@@ -2,9 +2,17 @@
  * Sideous Effects - GUI layout and Cairo painting, ported from sideous's
  * UIPainter.hpp: same Knob/Selector/Dropdown widget model, same
  * paintKnob/paintSelector/paintDropdown and hit-test-rect helpers, same
- * preset bar. Laid out as a 3-column x 2-row knob-panel grid (like sideous's own
- * OSC/FILTER/AMP ENV rows), not chipdrums' one-column-per-voice trigger-pad
- * style - this plugin has no MIDI notes to trigger.
+ * preset bar.
+ *
+ * Laid out as a 2-column x 3-row grid: the 5 reorderable tonal stages
+ * (Bitcrush, Fold, Ring Mod, Lofi Filter, Delay) fill cells 0-4 in
+ * signal-flow reading order (top-left -> top-right -> mid-left ->
+ * mid-right -> bottom-left) according to their current chain position (see
+ * Params.hpp's resolveChainOrder()), and can be dragged by their header
+ * strip to reorder the chain. Master (Drive/Output) is pinned to cell 5
+ * (bottom-right) always - it's the output gain stage, not a reorderable
+ * block. All 6 cells are uniformly sized, big enough for Delay's control
+ * count (the densest stage), since any stage can land in any cell.
  *
  * "Broken cassette deck" palette - muted, dusty warm greys/ambers instead of
  * any sibling's brighter retro-synth or neon-chip look, fitting a lo-fi
@@ -58,6 +66,10 @@ inline void setColor(cairo_t* cr, Color c, double a = 1.0) noexcept
 // -----------------------------------------------------------------------------------------------------------
 // layout model
 
+// height of a panel's title strip - also the drag-handle hit zone for the
+// 5 reorderable stage panels (Master's header doesn't respond to drag)
+static constexpr float kPanelHeaderH = 28.0f;
+
 struct Knob
 {
     uint32_t param;
@@ -90,9 +102,17 @@ struct Dropdown
     float x, y, w, h;
     std::vector<SelectorOption> options;
     Color accent;
+    const char* caption = nullptr;
 };
 
-struct PanelBox { float x, y, w, h; const char* title; Color accent; };
+struct PanelBox
+{
+    float x, y, w, h;
+    const char* title;
+    Color accent;
+    bool draggable = false; // true for the 5 reorderable stage panels
+    int stageIndex = -1;    // StageKind (see Params.hpp), -1 for Master
+};
 
 // preset bar: prev/next/save/delete buttons plus a name field. Deliberately
 // plain rectangles rather than reusing the Selector/Knob widgets - it isn't
@@ -109,7 +129,7 @@ struct PresetBarLayout
 struct Layout
 {
     float width, height;
-    std::vector<PanelBox> panels;
+    std::vector<PanelBox> panels; // 6 entries: [0..4] reorderable stages in current cell order, [5] Master
     std::vector<Knob> knobs;
     std::vector<Selector> selectors;
     std::vector<Dropdown> dropdowns;
@@ -158,7 +178,7 @@ inline std::vector<SelectorOption> syncOptions()
     };
 }
 
-inline Layout buildLayout(float width, float height)
+inline Layout buildLayout(float width, float height, const float* values)
 {
     Layout L;
     L.width = width;
@@ -167,13 +187,14 @@ inline Layout buildLayout(float width, float height)
     const float margin = 12.0f;
     const float gap = 8.0f;
     const float rowGap = 10.0f;
-    const float colW = (width - margin * 2.0f - gap * 2.0f) / 3.0f;
+    const float colW = (width - margin * 2.0f - gap) / 2.0f;
     const float col2X = margin + colW + gap;
-    const float col3X = col2X + colW + gap;
 
     const float presetBarY = 48.0f, presetBarH = 40.0f;
-    const float row1Y = presetBarY + presetBarH + rowGap, row1H = 150.0f;
-    const float row2Y = row1Y + row1H + rowGap, row2H = 150.0f;
+    const float rowH = 260.0f; // fits Delay's 2-row/7-knob content, the tallest of any reorderable stage
+    const float row1Y = presetBarY + presetBarH + rowGap;
+    const float row2Y = row1Y + rowH + rowGap;
+    const float row3Y = row2Y + rowH + rowGap;
 
     {
         L.presetBar.accent = kBitcrushAccent;
@@ -195,17 +216,46 @@ inline Layout buildLayout(float width, float height)
         L.presetBar.nameH = h;
     }
 
-    L.panels.push_back({ margin, row1Y, colW, row1H, "BITCRUSH", kBitcrushAccent }); // 0
-    L.panels.push_back({ col2X,  row1Y, colW, row1H, "FOLD",     kFoldAccent });     // 1
-    L.panels.push_back({ col3X,  row1Y, colW, row1H, "RING MOD", kRingModAccent });  // 2
-    L.panels.push_back({ margin, row2Y, colW, row2H, "LOFI FILTER", kLofiAccent });  // 3
-    L.panels.push_back({ col2X,  row2Y, colW, row2H, "DELAY",    kDelayAccent });    // 4
-    L.panels.push_back({ col3X,  row2Y, colW, row2H, "MASTER",   kMasterAccent });   // 5
+    // 6 grid cells, in signal-flow reading order - cells 0..4 hold whichever
+    // stage currently occupies that chain position, cell 5 is always Master
+    struct CellRect { float x, y, w, h; };
+    const CellRect cells[6] = {
+        { margin, row1Y, colW, rowH },
+        { col2X,  row1Y, colW, rowH },
+        { margin, row2Y, colW, rowH },
+        { col2X,  row2Y, colW, rowH },
+        { margin, row3Y, colW, rowH },
+        { col2X,  row3Y, colW, rowH },
+    };
+
+    int order[kStageCount];
+    resolveChainOrder(values, order);
+
+    static constexpr const char* kStageTitles[kStageCount] = { "BITCRUSH", "FOLD", "RING MOD", "LOFI FILTER", "DELAY" };
+    static constexpr Color kStageAccents[kStageCount] = { kBitcrushAccent, kFoldAccent, kRingModAccent, kLofiAccent, kDelayAccent };
+
+    PanelBox stagePanels[kStageCount]; // indexed by StageKind, not cell
+    for (int cellIdx = 0; cellIdx < kStageCount; ++cellIdx)
+    {
+        const int stage = order[cellIdx];
+        const CellRect& c = cells[cellIdx];
+        PanelBox p{ c.x, c.y, c.w, c.h, kStageTitles[stage], kStageAccents[stage], true, stage };
+        stagePanels[stage] = p;
+        L.panels.push_back(p);
+    }
+
+    // Master - always cell 5, not draggable
+    {
+        const CellRect& c = cells[5];
+        L.panels.push_back({ c.x, c.y, c.w, c.h, "MASTER", kMasterAccent, false, -1 });
+    }
+
+    const float firstRowOffset = kPanelHeaderH + 28.0f; // no-extras panels: header -> straight to knob row
 
     // --- bitcrush ---
     {
-        const PanelBox& p = L.panels[0];
-        addKnobRow(L.knobs, p.x, p.w, p.y + 26.0f + 30.0f, 20.0f, p.accent,
+        const PanelBox& p = stagePanels[kStageBitcrush];
+        addKnobRow(L.knobs, p.x, p.w, p.y + firstRowOffset, 20.0f, p.accent,
                    {
                        { kParamBitcrushBits, "BITS" },
                        { kParamBitcrushRate, "RATE" },
@@ -215,8 +265,8 @@ inline Layout buildLayout(float width, float height)
 
     // --- fold ---
     {
-        const PanelBox& p = L.panels[1];
-        addKnobRow(L.knobs, p.x, p.w, p.y + 26.0f + 30.0f, 20.0f, p.accent,
+        const PanelBox& p = stagePanels[kStageFold];
+        addKnobRow(L.knobs, p.x, p.w, p.y + firstRowOffset, 20.0f, p.accent,
                    {
                        { kParamFoldDrive, "DRIVE" },
                        { kParamFoldMix,   "MIX" },
@@ -225,12 +275,12 @@ inline Layout buildLayout(float width, float height)
 
     // --- ring mod ---
     {
-        const PanelBox& p = L.panels[2];
+        const PanelBox& p = stagePanels[kStageRingMod];
 
         Selector wave;
         wave.param = kParamRingModWave;
         wave.accent = p.accent;
-        wave.x = p.x + 12.0f; wave.y = p.y + 26.0f; wave.w = p.w - 24.0f; wave.h = 24.0f;
+        wave.x = p.x + 12.0f; wave.y = p.y + kPanelHeaderH + 4.0f; wave.w = p.w - 24.0f; wave.h = 24.0f;
         wave.options = { { 0.0f, "SAW" }, { 1.0f, "PULSE" }, { 2.0f, "TRI" } };
         L.selectors.push_back(wave);
 
@@ -243,8 +293,8 @@ inline Layout buildLayout(float width, float height)
 
     // --- lofi filter ---
     {
-        const PanelBox& p = L.panels[3];
-        addKnobRow(L.knobs, p.x, p.w, p.y + 26.0f + 30.0f, 20.0f, p.accent,
+        const PanelBox& p = stagePanels[kStageLofi];
+        addKnobRow(L.knobs, p.x, p.w, p.y + firstRowOffset, 20.0f, p.accent,
                    {
                        { kParamLofiCutoff, "CUTOFF" },
                        { kParamLofiReso,   "RESO" },
@@ -252,21 +302,71 @@ inline Layout buildLayout(float width, float height)
                    });
     }
 
-    // --- delay ---
+    // --- delay --- (the dense one: Sync + 3 arp-shape selectors on two
+    // lines, then a 5-knob row)
     {
-        const PanelBox& p = L.panels[4];
+        const PanelBox& p = stagePanels[kStageDelay];
+        const float usable = p.w - 24.0f;
+        // line1's caption ("SYNC"/"STEPS", drawn 6px above its own row)
+        // needs clearance below the panel title text, not just kPanelHeaderH
+        const float line1Y = p.y + kPanelHeaderH + 14.0f;
+        // line2's caption ("CURVE"/"DIR") needs the same clearance below
+        // line1's controls
+        const float line2Y = line1Y + 24.0f + 16.0f;
 
         Dropdown sync;
         sync.param = kParamDelaySync;
         sync.accent = p.accent;
-        sync.x = p.x + 12.0f; sync.y = p.y + 26.0f; sync.w = p.w - 24.0f; sync.h = 24.0f;
+        sync.caption = "SYNC";
+        sync.x = p.x + 12.0f; sync.y = line1Y; sync.h = 24.0f;
+        sync.w = usable * 0.42f;
         sync.options = syncOptions();
         L.dropdowns.push_back(sync);
 
-        addKnobRow(L.knobs, p.x, p.w, sync.y + sync.h + 34.0f, 20.0f, p.accent,
+        Selector steps;
+        steps.param = kParamDelayArpSteps;
+        steps.accent = p.accent;
+        steps.caption = "STEPS";
+        steps.x = sync.x + sync.w + 8.0f; steps.y = line1Y; steps.h = 24.0f;
+        steps.w = usable - sync.w - 8.0f;
+        steps.options = { { 2.0f, "2" }, { 3.0f, "3" }, { 4.0f, "4" } };
+        L.selectors.push_back(steps);
+
+        Selector curve;
+        curve.param = kParamDelayArpCurve;
+        curve.accent = p.accent;
+        curve.caption = "CURVE";
+        curve.x = p.x + 12.0f; curve.y = line2Y; curve.h = 24.0f;
+        curve.w = usable * 0.42f;
+        curve.options = { { 0.0f, "PITCH" }, { 1.0f, "TEMPO" } };
+        L.selectors.push_back(curve);
+
+        Selector direction;
+        direction.param = kParamDelayArpDirection;
+        direction.accent = p.accent;
+        direction.caption = "DIR";
+        direction.x = curve.x + curve.w + 8.0f; direction.y = line2Y; direction.h = 24.0f;
+        direction.w = usable - curve.w - 8.0f;
+        direction.options = { { 0.0f, "UP" }, { 1.0f, "DOWN" }, { 2.0f, "UP-DN" } };
+        L.selectors.push_back(direction);
+
+        // 7 knobs total, split across two rows so none get too cramped:
+        // row 1 groups the "what pitch/rate does each repeat play at"
+        // fundamentals, row 2 groups mix/character controls.
+        const float knobRow1Y = line2Y + 24.0f + 34.0f;
+        const float knobRow2Y = knobRow1Y + 64.0f;
+
+        addKnobRow(L.knobs, p.x, p.w, knobRow1Y, 20.0f, p.accent,
                    {
                        { kParamDelayFeedback, "FDBK" },
                        { kParamDelayArp,      "ARP" },
+                       { kParamDelaySpeed,    "SPEED" },
+                       { kParamDelayRamp,     "RAMP" },
+                   });
+        addKnobRow(L.knobs, p.x, p.w, knobRow2Y, 20.0f, p.accent,
+                   {
+                       { kParamDelayPingPong, "P-PONG" },
+                       { kParamDelayJitter,   "JITTER" },
                        { kParamDelayMix,      "MIX" },
                    });
     }
@@ -274,7 +374,7 @@ inline Layout buildLayout(float width, float height)
     // --- master ---
     {
         const PanelBox& p = L.panels[5];
-        addKnobRow(L.knobs, p.x, p.w, p.y + 26.0f + 30.0f, 20.0f, p.accent,
+        addKnobRow(L.knobs, p.x, p.w, p.y + firstRowOffset, 20.0f, p.accent,
                    {
                        { kParamMasterOutput, "OUTPUT" },
                        { kParamMasterDrive,  "DRIVE" },
@@ -318,6 +418,27 @@ inline float normalizedToParam(uint32_t param, float t) noexcept
     return info.min + (info.max - info.min) * t;
 }
 
+// snaps a value to the nearest whole semitone step, for knobs where that's
+// musically meaningful - Arp (already in semitones, just rounds) and Speed
+// (a rate multiplier, rounded in log2-semitone-space so it lands on the
+// same chromatic grid a tape/turntable pitch control would use). A no-op
+// for every other param. Used when the user holds Shift while dragging or
+// scrolling a knob.
+inline float quantizeToSemitoneStep(uint32_t param, float value) noexcept
+{
+    if (param == kParamDelayArp)
+        return std::round(value);
+
+    if (param == kParamDelaySpeed)
+    {
+        const ParamInfo& info = getParamInfo(param);
+        const float snapped = std::exp2(std::round(std::log2(value) * 12.0f) / 12.0f);
+        return snapped < info.min ? info.min : (snapped > info.max ? info.max : snapped);
+    }
+
+    return value;
+}
+
 // selector/dropdown option rects are needed both for drawing and for mouse
 // hit-testing; compute them in one place so the two can't drift apart.
 inline void getSelectorOptionRect(const Selector& sel, size_t i, double& ox, double& ow) noexcept
@@ -332,9 +453,8 @@ inline void getSelectorOptionRect(const Selector& sel, size_t i, double& ox, dou
 // the list would otherwise run off the bottom of the window and there's
 // more room above the closed box than below it (Delay's Sync list has 17
 // entries). The whole list is then clamped to stay within [0, layoutHeight]
-// - this plugin's window is short enough that a 17-entry list doesn't fully
-// fit *either* direction from some closed-box positions, and an unclamped
-// list would render (and be unclickable) partly off-screen.
+// - an unclamped list would render (and be unclickable) partly off-screen
+// if it doesn't fully fit in either direction.
 inline void getDropdownOptionRect(const Dropdown& dd, size_t i, float layoutHeight, double& oy, double& oh) noexcept
 {
     const double n = (double)dd.options.size();
@@ -440,6 +560,13 @@ struct PaintState
     const char* presetEditBuffer = "";
     int hoverPresetButton = -1;
     bool presetDeleteEnabled = false;
+
+    // panel drag-to-reorder state
+    int hoverPanel = -1;      // index into Layout::panels, header-strip hover only
+    int dragPanel = -1;       // index into Layout::panels currently being dragged, or -1
+    int dropTargetCell = -1;  // cell 0-4 the drag is currently hovering as a drop target, or -1
+    double dragGhostX = 0.0;  // top-left of the floating ghost while dragging
+    double dragGhostY = 0.0;
 };
 
 inline void paintKnob(cairo_t* cr, const Knob& k, float value, bool hovered, bool dragging, bool autoShow)
@@ -536,6 +663,13 @@ inline const char* findOptionLabel(const std::vector<SelectorOption>& options, f
 
 inline void paintDropdownClosed(cairo_t* cr, const Dropdown& dd, float value, bool hovered, bool open)
 {
+    if (dd.caption != nullptr)
+    {
+        setFont(cr, 9.0, false);
+        setColor(cr, kTextDim);
+        drawText(cr, dd.caption, dd.x, dd.y - 6.0);
+    }
+
     roundedRect(cr, dd.x, dd.y, dd.w, dd.h, 4.0);
     setColor(cr, kBtnBg, (hovered || open) ? 1.0 : 0.85);
     cairo_fill_preserve(cr);
@@ -648,6 +782,26 @@ inline void paintPresetBar(cairo_t* cr, const PresetBarLayout& pb, const PaintSt
     }
 }
 
+// a semi-transparent copy of the dragged panel's box + title, following the
+// cursor - the source cell's real content stays in place (dimmed, see
+// paint()) until the drag resolves.
+inline void paintDragGhost(cairo_t* cr, const PanelBox& p, double ghostX, double ghostY)
+{
+    roundedRect(cr, ghostX, ghostY, p.w, p.h, 8.0);
+    setColor(cr, kPanelBg, 0.85);
+    cairo_fill_preserve(cr);
+    setColor(cr, p.accent, 0.95);
+    cairo_set_line_width(cr, 2.5);
+    cairo_stroke(cr);
+
+    if (p.title != nullptr)
+    {
+        setFont(cr, 12.0);
+        setColor(cr, p.accent, 0.95);
+        drawText(cr, p.title, ghostX + 14.0, ghostY + 22.0);
+    }
+}
+
 inline void paint(cairo_t* cr, const Layout& L, const PaintState& state)
 {
     setColor(cr, kBg);
@@ -668,20 +822,46 @@ inline void paint(cairo_t* cr, const Layout& L, const PaintState& state)
 
     paintPresetBar(cr, L.presetBar, state);
 
-    for (const PanelBox& p : L.panels)
+    // drop-target highlight, drawn under the panels so their own border
+    // still reads on top
+    if (state.dropTargetCell >= 0 && (size_t)state.dropTargetCell < L.panels.size())
     {
+        const PanelBox& target = L.panels[(size_t)state.dropTargetCell];
+        roundedRect(cr, target.x - 3.0, target.y - 3.0, target.w + 6.0, target.h + 6.0, 10.0);
+        setColor(cr, target.accent, 0.9);
+        cairo_set_line_width(cr, 3.0);
+        cairo_stroke(cr);
+    }
+
+    for (size_t i = 0; i < L.panels.size(); ++i)
+    {
+        const PanelBox& p = L.panels[i];
+        const bool isDragSource = (int)i == state.dragPanel;
+
         roundedRect(cr, p.x, p.y, p.w, p.h, 8.0);
-        setColor(cr, kPanelBg);
+        setColor(cr, kPanelBg, isDragSource ? 0.4 : 1.0);
         cairo_fill_preserve(cr);
-        setColor(cr, p.accent, 0.7);
-        cairo_set_line_width(cr, 1.5);
+        setColor(cr, p.accent, isDragSource ? 0.3 : ((int)i == state.hoverPanel && p.draggable ? 1.0 : 0.7));
+        cairo_set_line_width(cr, (int)i == state.hoverPanel && p.draggable && !isDragSource ? 2.5 : 1.5);
         cairo_stroke(cr);
 
         if (p.title != nullptr)
         {
             setFont(cr, 12.0);
-            setColor(cr, p.accent);
+            setColor(cr, p.accent, isDragSource ? 0.4 : 1.0);
             drawText(cr, p.title, p.x + 14.0, p.y + 22.0);
+
+            // a small drag-handle affordance (dots) at the header's right
+            // edge for the reorderable panels, so it reads as grabbable
+            if (p.draggable)
+            {
+                setColor(cr, p.accent, isDragSource ? 0.3 : 0.55);
+                for (int dot = 0; dot < 3; ++dot)
+                {
+                    cairo_arc(cr, p.x + p.w - 16.0, p.y + 10.0 + (double)dot * 5.0, 1.6, 0.0, 2.0 * M_PI);
+                    cairo_fill(cr);
+                }
+            }
         }
     }
 
@@ -710,6 +890,9 @@ inline void paint(cairo_t* cr, const Layout& L, const PaintState& state)
         const Dropdown& dd = L.dropdowns[state.openDropdown];
         paintDropdownOpenList(cr, dd, state.values[dd.param], state.hoverDropdownOption, L.height);
     }
+
+    if (state.dragPanel >= 0 && (size_t)state.dragPanel < L.panels.size())
+        paintDragGhost(cr, L.panels[(size_t)state.dragPanel], state.dragGhostX, state.dragGhostY);
 }
 
 } // namespace ui
